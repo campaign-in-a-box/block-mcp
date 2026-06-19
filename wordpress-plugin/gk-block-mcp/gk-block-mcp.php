@@ -3,7 +3,7 @@
  * Plugin Name: Block MCP by GravityKit
  * Plugin URI: https://www.gravitykit.com/wordpress-block-mcp/
  * Description: Lets an AI assistant (Claude, Cursor) safely create and edit your WordPress content over the Model Context Protocol (MCP).
- * Version: 2.0.3
+ * Version: 2.0.4
  * Author: GravityKit
  * Author URI: https://www.gravitykit.com
  * License: GPL-2.0-or-later
@@ -35,7 +35,7 @@ if ( ! defined( 'GK_BLOCK_MCP_DISABLE_FOUNDATION' ) ) {
 	}
 }
 
-define( 'GK_BLOCK_MCP_VERSION', '2.0.3' );
+define( 'GK_BLOCK_MCP_VERSION', '2.0.4' );
 define( 'GK_BLOCK_MCP_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'GK_BLOCK_MCP_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 
@@ -136,33 +136,42 @@ function merge_manual_dual_storage_blocks( $defaults ) {
 }
 
 /**
+ * Build the shared REST controller and its service graph.
+ *
+ * @return REST_Controller
+ */
+function create_rest_controller() {
+	$preferences      = new Preferences();
+	$block_inventory  = new Block_Inventory();
+	$block_registry   = new Block_Registry( $preferences, $block_inventory );
+	$pattern_manager  = new Pattern_Manager( $preferences );
+	$block_safety     = new Block_Safety();
+	$html_transformer = new HTML_Transformer();
+	$block_crud       = new Block_CRUD( $preferences, $block_safety, $html_transformer, $block_inventory );
+	$block_mutator    = new Block_Mutator( $block_crud, $preferences, $block_safety, $html_transformer );
+	$post_manager     = new Post_Manager( $block_crud );
+	$term_manager     = new Term_Manager();
+	$media_manager    = new Media_Manager();
+
+	return new REST_Controller(
+		$block_registry,
+		$pattern_manager,
+		$block_crud,
+		$block_inventory,
+		$block_mutator,
+		$post_manager,
+		$term_manager,
+		$media_manager,
+		$preferences
+	);
+}
+
+/**
  * Initialize REST routes.
  */
 function init_rest_api() {
 	try {
-		$preferences      = new Preferences();
-		$block_inventory  = new Block_Inventory();
-		$block_registry   = new Block_Registry( $preferences, $block_inventory );
-		$pattern_manager  = new Pattern_Manager( $preferences );
-		$block_safety     = new Block_Safety();
-		$html_transformer = new HTML_Transformer();
-		$block_crud       = new Block_CRUD( $preferences, $block_safety, $html_transformer, $block_inventory );
-		$block_mutator    = new Block_Mutator( $block_crud, $preferences, $block_safety, $html_transformer );
-		$post_manager     = new Post_Manager( $block_crud );
-		$term_manager     = new Term_Manager();
-		$media_manager    = new Media_Manager();
-
-		$controller = new REST_Controller(
-			$block_registry,
-			$pattern_manager,
-			$block_crud,
-			$block_inventory,
-			$block_mutator,
-			$post_manager,
-			$term_manager,
-			$media_manager,
-			$preferences
-		);
+		$controller = create_rest_controller();
 
 		$controller->register_routes();
 
@@ -184,6 +193,53 @@ function init_rest_api() {
 	}
 }
 add_action( 'rest_api_init', __NAMESPACE__ . '\\init_rest_api' );
+
+/**
+ * Register Block MCP tools with the WordPress Abilities API (mcp-adapter).
+ *
+ * @since 2.0.4
+ */
+function init_ability_categories() {
+	if ( ! apply_filters( 'gk/block-mcp/register-abilities', true ) ) {
+		return;
+	}
+	if ( ! function_exists( 'wp_register_ability_category' ) ) {
+		return;
+	}
+
+	wp_register_ability_category(
+		'gk-block-mcp',
+		array(
+			'label'       => __( 'Block MCP', 'gk-block-mcp' ),
+			'description' => __( 'Block-level WordPress content CRUD for AI agents.', 'gk-block-mcp' ),
+		)
+	);
+}
+add_action( 'wp_abilities_api_categories_init', __NAMESPACE__ . '\\init_ability_categories' );
+
+/**
+ * Register Block MCP tool abilities.
+ *
+ * @since 2.0.4
+ */
+function init_abilities() {
+	if ( ! apply_filters( 'gk/block-mcp/register-abilities', true ) ) {
+		return;
+	}
+	if ( ! function_exists( 'wp_register_ability' ) ) {
+		return;
+	}
+
+	try {
+		$controller = create_rest_controller();
+		( new Abilities_Registrar( $controller, new Yoast_Bridge() ) )->register();
+	} catch ( \Throwable $e ) {
+		if ( defined( 'WP_DEBUG' ) && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG && WP_DEBUG_LOG ) {
+			error_log( 'Block MCP abilities init error: ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		}
+	}
+}
+add_action( 'wp_abilities_api_init', __NAMESPACE__ . '\\init_abilities' );
 
 /**
  * Settings page bootstrap. Admin-only via is_admin() guard.

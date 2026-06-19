@@ -1,0 +1,100 @@
+<?php
+/**
+ * Abilities API registration tests.
+ *
+ * @package GravityKit\BlockMCP\Tests
+ */
+
+declare( strict_types=1 );
+
+use GravityKit\BlockMCP\Abilities_Registrar;
+use GravityKit\BlockMCP\REST_Controller;
+
+/**
+ * @covers \GravityKit\BlockMCP\Abilities_Registrar
+ */
+class AbilitiesRegistrarTest extends RestControllerTestCase {
+
+	public function set_up(): void {
+		parent::set_up();
+		$this->trigger_abilities_init();
+	}
+
+	/**
+	 * Fire wp_abilities_api_init so the plugin registers its abilities.
+	 */
+	private function trigger_abilities_init(): void {
+		if ( ! function_exists( 'wp_register_ability' ) ) {
+			$this->markTestSkipped( 'WordPress Abilities API is not available in this environment.' );
+		}
+		do_action( 'wp_abilities_api_categories_init' );
+		do_action( 'wp_abilities_api_init' );
+	}
+
+	public function test_registers_core_abilities(): void {
+		$this->assertTrue( wp_has_ability( 'gk-block-mcp/get-page-blocks' ) );
+		$this->assertTrue( wp_has_ability( 'gk-block-mcp/update-block' ) );
+		$this->assertTrue( wp_has_ability( 'gk-block-mcp/list-block-types' ) );
+	}
+
+	public function test_get_page_blocks_denied_for_subscriber(): void {
+		$subscriber_id = self::factory()->user->create( array( 'role' => 'subscriber' ) );
+		wp_set_current_user( $subscriber_id );
+
+		$ability = wp_get_ability( 'gk-block-mcp/get-page-blocks' );
+		$this->assertNotNull( $ability );
+
+		$allowed = $ability->check_permissions( array( 'post_id' => 1 ) );
+		$this->assertWPError( $allowed );
+	}
+
+	public function test_get_page_blocks_executes_for_editor(): void {
+		$editor_id = self::factory()->user->create( array( 'role' => 'editor' ) );
+		wp_set_current_user( $editor_id );
+
+		$post_id = $this->make_block_post(
+			array(
+				array(
+					'blockName' => 'core/paragraph',
+					'attrs'     => array(),
+					'innerHTML' => '<p>Abilities test</p>',
+				),
+			)
+		);
+
+		$ability = wp_get_ability( 'gk-block-mcp/get-page-blocks' );
+		$this->assertNotNull( $ability );
+
+		$result = $ability->execute( array( 'post_id' => $post_id ) );
+		$this->assertIsArray( $result );
+		$this->assertArrayHasKey( 'blocks', $result );
+		$this->assertNotEmpty( $result['blocks'] );
+	}
+
+	public function test_update_block_requires_target(): void {
+		$editor_id = self::factory()->user->create( array( 'role' => 'editor' ) );
+		wp_set_current_user( $editor_id );
+
+		$post_id = $this->make_block_post(
+			array(
+				array(
+					'blockName' => 'core/paragraph',
+					'attrs'     => array(),
+					'innerHTML' => '<p>Before</p>',
+				),
+			)
+		);
+
+		$ability = wp_get_ability( 'gk-block-mcp/update-block' );
+		$this->assertNotNull( $ability );
+
+		$result = $ability->execute(
+			array(
+				'post_id'    => $post_id,
+				'attributes' => array( 'content' => 'After' ),
+			)
+		);
+		$this->assertWPError( $result );
+		$this->assertSame( 'invalid_input', $result->get_error_code() );
+	}
+}

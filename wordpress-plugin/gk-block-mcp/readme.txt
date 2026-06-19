@@ -4,7 +4,7 @@ Tags: blocks, rest-api, gutenberg, mcp, ai
 Requires at least: 6.0
 Tested up to: 6.9
 Requires PHP: 7.4
-Stable tag: 2.0.3
+Stable tag: 2.0.4
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -119,6 +119,16 @@ Visit Settings → Block MCP. Set the score for a namespace to less than 10 to m
 `uninstall.php` deletes all plugin options and transients (`gk_block_api_preferences`, `gk_block_api_post_types_allowlist`, `gk_block_api_storage_modes`, the manual dual-storage list, the inventory cache, and per-post rate-limit transients). Post content and revisions are not touched.
 
 == Changelog ==
+
+= 2.0.4 on June 20, 2026 =
+
+Registers Block MCP REST tools as WordPress Abilities so the official MCP Adapter can expose them as MCP tools without the standalone TypeScript stdio server.
+
+#### ✨ Added
+
+* Registers ~25 block MCP tools (`gk-block-mcp/get-page-blocks`, `gk-block-mcp/update-block`, etc.) via `wp_register_ability()` with `meta.mcp.public` for mcp-adapter discovery.
+* Abilities delegate to the same REST handlers as `gk-block-api/v1`; the standalone `@gravitykit/block-mcp` stdio path remains supported.
+* Filter `gk/block-mcp/register-abilities` (default on) gates registration.
 
 = 2.0.3 on June 17, 2026 =
 
