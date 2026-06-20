@@ -408,8 +408,18 @@ class Abilities_Registrar {
 				'description' => 'Upload to the media library via URL or base64.',
 				'readonly'    => false,
 				'permission'  => 'upload',
-				'input'       => array( 'type' => 'object' ),
-				'execute'     => array( $this, 'execute_simple_post_body' ),
+				'input'       => array(
+					'type'       => 'object',
+					'properties' => array(
+						'url'         => array( 'type' => 'string' ),
+						'base64'      => array( 'type' => 'string' ),
+						'filename'    => array( 'type' => 'string' ),
+						'title'       => array( 'type' => 'string' ),
+						'alt'         => array( 'type' => 'string' ),
+						'description' => array( 'type' => 'string' ),
+					),
+				),
+				'execute'     => array( $this, 'execute_upload_media' ),
 				'handler'     => array( $this->controller, 'upload_media' ),
 				'method'      => 'POST',
 				'route'       => '/media',
@@ -494,7 +504,13 @@ class Abilities_Registrar {
 				'permission_callback' => function () use ( $def ) {
 					return $this->check_permission( $def['permission'] );
 				},
-				'execute_callback'    => function ( array $input ) use ( $def ) {
+				'execute_callback'    => function ( $input = null ) use ( $def ) {
+					if ( $input instanceof \stdClass ) {
+						$input = (array) $input;
+					}
+					if ( ! is_array( $input ) ) {
+						$input = array();
+					}
 					return call_user_func( $def['execute'], $input, $def );
 				},
 				'meta'                => array(
@@ -548,6 +564,23 @@ class Abilities_Registrar {
 	 * @return array<string, mixed>|\WP_Error
 	 */
 	public function execute_get_route( array $input, array $def ) {
+		$params  = Abilities_Rest_Bridge::normalize_input( $input );
+		$request = Abilities_Rest_Bridge::make_request(
+			$def['method'],
+			REST_Controller::NAMESPACE . $def['route'],
+			$params
+		);
+		return Abilities_Rest_Bridge::invoke( $def['handler'], $request );
+	}
+
+	/**
+	 * POST /media — no post_id in route.
+	 *
+	 * @param array<string, mixed> $input Raw input.
+	 * @param array<string, mixed> $def   Ability definition.
+	 * @return array<string, mixed>|\WP_Error
+	 */
+	public function execute_upload_media( array $input, array $def ) {
 		$params  = Abilities_Rest_Bridge::normalize_input( $input );
 		$request = Abilities_Rest_Bridge::make_request(
 			$def['method'],
