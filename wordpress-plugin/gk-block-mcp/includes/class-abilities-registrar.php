@@ -899,12 +899,20 @@ class Abilities_Registrar {
 			return $post_id;
 		}
 
-		$params  = Abilities_Rest_Bridge::normalize_input( $input );
-		$params['post_id'] = $post_id;
-		$request = Abilities_Rest_Bridge::make_request(
+		$body = Abilities_Rest_Bridge::normalize_input( $input );
+		unset( $body['id'], $body['post_id'] );
+
+		if ( empty( $body ) ) {
+			return Abilities_Rest_Bridge::validation_error(
+				__( 'At least one SEO field (e.g. title, description) is required.', 'gk-block-mcp' )
+			);
+		}
+
+		$request = Abilities_Rest_Bridge::make_request_with_json_body(
 			'PATCH',
 			REST_Controller::NAMESPACE . '/yoast/' . $post_id,
-			$params
+			array( 'post_id' => $post_id ),
+			$body
 		);
 		return Abilities_Rest_Bridge::invoke( array( $this->yoast, 'update_seo' ), $request );
 	}
@@ -916,9 +924,15 @@ class Abilities_Registrar {
 	 * @return array<string, mixed>|\WP_Error
 	 */
 	public function execute_yoast_bulk( array $input ) {
-		$request = Abilities_Rest_Bridge::make_request(
+		if ( isset( $input['items'] ) && ! isset( $input['posts'] ) ) {
+			$input['posts'] = $input['items'];
+			unset( $input['items'] );
+		}
+
+		$request = Abilities_Rest_Bridge::make_request_with_json_body(
 			'PATCH',
 			REST_Controller::NAMESPACE . '/yoast/bulk',
+			array(),
 			$input
 		);
 		return Abilities_Rest_Bridge::invoke( array( $this->yoast, 'bulk_update_seo' ), $request );

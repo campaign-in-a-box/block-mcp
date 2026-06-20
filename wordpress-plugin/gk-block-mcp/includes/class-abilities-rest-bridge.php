@@ -69,6 +69,32 @@ class Abilities_Rest_Bridge {
 	}
 
 	/**
+	 * Build a REST request with a JSON body (for handlers that use get_json_params()).
+	 *
+	 * MCP ability input is flat key/value pairs; REST PATCH handlers such as
+	 * Yoast_Bridge::update_seo() read the body via get_json_params(), which only
+	 * parses set_body() — not set_param(). Route/query params are still set
+	 * separately so URL placeholders and permission checks work.
+	 *
+	 * @param string               $method       HTTP method.
+	 * @param string               $route        REST route path.
+	 * @param array<string, mixed> $route_params URL/route parameters (e.g. post_id).
+	 * @param array<string, mixed> $json_body    JSON request body object.
+	 * @return \WP_REST_Request
+	 */
+	public static function make_request_with_json_body( $method, $route, array $route_params = array(), array $json_body = array() ) {
+		$request = new \WP_REST_Request( $method, $route );
+		foreach ( $route_params as $key => $value ) {
+			$request->set_param( $key, $value );
+		}
+		if ( ! empty( $json_body ) ) {
+			$request->set_header( 'Content-Type', 'application/json' );
+			$request->set_body( wp_json_encode( $json_body ) );
+		}
+		return $request;
+	}
+
+	/**
 	 * Invoke a REST handler and return response data or WP_Error.
 	 *
 	 * @param callable             $handler REST_Controller or Yoast_Bridge method.

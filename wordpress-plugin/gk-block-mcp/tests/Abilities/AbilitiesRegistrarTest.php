@@ -97,4 +97,81 @@ class AbilitiesRegistrarTest extends RestControllerTestCase {
 		$this->assertWPError( $result );
 		$this->assertSame( 'invalid_input', $result->get_error_code() );
 	}
+
+	/**
+	 * MCP flat params must reach Yoast_Bridge::update_seo() as a JSON body.
+	 *
+	 * @group yoast
+	 */
+	public function test_yoast_update_seo_accepts_flat_mcp_params(): void {
+		if ( ! defined( 'WPSEO_FILE' ) ) {
+			$this->markTestSkipped( 'Yoast SEO is not loaded.' );
+		}
+
+		$editor_id = self::factory()->user->create( array( 'role' => 'editor' ) );
+		wp_set_current_user( $editor_id );
+
+		$post_id = self::factory()->post->create(
+			array(
+				'post_type'   => 'page',
+				'post_status' => 'publish',
+			)
+		);
+
+		$ability = wp_get_ability( 'gk-block-mcp/yoast-update-seo' );
+		$this->assertNotNull( $ability );
+
+		$result = $ability->execute(
+			array(
+				'post_id'     => $post_id,
+				'title'       => 'MCP SEO Title',
+				'description' => 'MCP meta description.',
+			)
+		);
+
+		$this->assertIsArray( $result );
+		$this->assertSame( 'MCP SEO Title', $result['title'] );
+		$this->assertSame( 'MCP meta description.', $result['description'] );
+	}
+
+	/**
+	 * Bulk ability accepts MCP-style `items` alias for REST `posts`.
+	 *
+	 * @group yoast
+	 */
+	public function test_yoast_bulk_update_seo_accepts_items_alias(): void {
+		if ( ! defined( 'WPSEO_FILE' ) ) {
+			$this->markTestSkipped( 'Yoast SEO is not loaded.' );
+		}
+
+		$editor_id = self::factory()->user->create( array( 'role' => 'editor' ) );
+		wp_set_current_user( $editor_id );
+
+		$post_id = self::factory()->post->create(
+			array(
+				'post_type'   => 'page',
+				'post_status' => 'publish',
+			)
+		);
+
+		$ability = wp_get_ability( 'gk-block-mcp/yoast-bulk-update-seo' );
+		$this->assertNotNull( $ability );
+
+		$result = $ability->execute(
+			array(
+				'items' => array(
+					array(
+						'post_id'     => $post_id,
+						'title'       => 'Bulk MCP Title',
+						'description' => 'Bulk MCP description.',
+					),
+				),
+			)
+		);
+
+		$this->assertIsArray( $result );
+		$this->assertCount( 1, $result );
+		$this->assertSame( 'Bulk MCP Title', $result[0]['title'] );
+		$this->assertSame( 'Bulk MCP description.', $result[0]['description'] );
+	}
 }
