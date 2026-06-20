@@ -218,6 +218,46 @@ function init_ability_categories() {
 add_action( 'wp_abilities_api_categories_init', __NAMESPACE__ . '\\init_ability_categories' );
 
 /**
+ * Ensure mcp-adapter/execute-ability output schema validates without PHP warnings.
+ *
+ * WooCommerce bundles an older copy of mcp-adapter whose execute-ability output
+ * schema omits `type` on the `data` property. WordPress still validates output
+ * (defaulting to valid) but emits three PHP warnings per MCP tool call.
+ *
+ * @since 2.0.5
+ *
+ * @param array<string, mixed> $args Ability registration args.
+ * @param string               $name Fully-qualified ability name.
+ * @return array<string, mixed>
+ */
+function patch_mcp_execute_ability_output_schema( array $args, string $name ): array {
+	if ( 'mcp-adapter/execute-ability' !== $name ) {
+		return $args;
+	}
+
+	if ( empty( $args['output_schema']['properties']['data'] ) || ! is_array( $args['output_schema']['properties']['data'] ) ) {
+		return $args;
+	}
+
+	if ( isset( $args['output_schema']['properties']['data']['type'] ) ) {
+		return $args;
+	}
+
+	$args['output_schema']['properties']['data']['type'] = array(
+		'object',
+		'array',
+		'string',
+		'number',
+		'integer',
+		'boolean',
+		'null',
+	);
+
+	return $args;
+}
+add_filter( 'wp_register_ability_args', __NAMESPACE__ . '\\patch_mcp_execute_ability_output_schema', 10, 2 );
+
+/**
  * Register Block MCP tool abilities.
  *
  * @since 2.0.4
