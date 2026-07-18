@@ -174,4 +174,37 @@ class AbilitiesRegistrarTest extends RestControllerTestCase {
 		$this->assertSame( 'Bulk MCP Title', $result[0]['title'] );
 		$this->assertSame( 'Bulk MCP description.', $result[0]['description'] );
 	}
+
+	/**
+	 * upload-media schema must advertise Media_Manager keys (data_base64 / alt_text).
+	 */
+	public function test_upload_media_schema_uses_media_manager_keys(): void {
+		$ability = wp_get_ability( 'gk-block-mcp/upload-media' );
+		$this->assertNotNull( $ability );
+
+		$schema     = $ability->get_input_schema();
+		$properties = isset( $schema['properties'] ) && is_array( $schema['properties'] ) ? $schema['properties'] : array();
+
+		$this->assertArrayHasKey( 'data_base64', $properties );
+		$this->assertArrayHasKey( 'alt_text', $properties );
+		$this->assertArrayHasKey( 'url', $properties );
+		$this->assertArrayHasKey( 'filename', $properties );
+	}
+
+	/**
+	 * Legacy ability param names must normalize to Media_Manager keys.
+	 */
+	public function test_upload_media_aliases_normalize_to_media_manager_keys(): void {
+		$normalized = \GravityKit\BlockMCP\Abilities_Rest_Bridge::normalize_input(
+			array(
+				'base64' => 'Zm9v',
+				'alt'    => 'legacy alt',
+			)
+		);
+
+		$this->assertSame( 'Zm9v', $normalized['data_base64'] );
+		$this->assertSame( 'legacy alt', $normalized['alt_text'] );
+		$this->assertArrayNotHasKey( 'base64', $normalized );
+		$this->assertArrayNotHasKey( 'alt', $normalized );
+	}
 }

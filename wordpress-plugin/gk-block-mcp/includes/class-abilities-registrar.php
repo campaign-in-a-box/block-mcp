@@ -405,18 +405,41 @@ class Abilities_Registrar {
 			array(
 				'slug'        => 'upload-media',
 				'label'       => 'Upload media',
-				'description' => 'Upload to the media library via URL or base64.',
+				'description' => 'Upload to the media library. Prefer url (server sideloads; most efficient for agents). Use data_base64 + filename only for small local files that are not publicly reachable. Exactly one of url or data_base64.',
 				'readonly'    => false,
 				'permission'  => 'upload',
 				'input'       => array(
 					'type'       => 'object',
 					'properties' => array(
-						'url'         => array( 'type' => 'string' ),
-						'base64'      => array( 'type' => 'string' ),
-						'filename'    => array( 'type' => 'string' ),
-						'title'       => array( 'type' => 'string' ),
-						'alt'         => array( 'type' => 'string' ),
-						'description' => array( 'type' => 'string' ),
+						'url'          => array(
+							'type'        => 'string',
+							'description' => 'Public HTTP(S) URL for the server to sideload (preferred).',
+						),
+						'data_base64'  => array(
+							'type'        => 'string',
+							'description' => 'Base64-encoded file bytes. Requires filename. Prefer url when possible.',
+						),
+						'filename'     => array(
+							'type'        => 'string',
+							'description' => 'Required when using data_base64 (e.g. hero.png).',
+						),
+						'title'        => array( 'type' => 'string' ),
+						'alt_text'     => array( 'type' => 'string' ),
+						'caption'      => array( 'type' => 'string' ),
+						'description'  => array( 'type' => 'string' ),
+						'post_id'      => array(
+							'type'        => 'integer',
+							'description' => 'Optional parent post to attach the media to.',
+						),
+						// Legacy aliases (normalized to data_base64 / alt_text).
+						'base64'       => array(
+							'type'        => 'string',
+							'description' => 'Deprecated alias for data_base64.',
+						),
+						'alt'          => array(
+							'type'        => 'string',
+							'description' => 'Deprecated alias for alt_text.',
+						),
 					),
 				),
 				'execute'     => array( $this, 'execute_upload_media' ),
@@ -581,7 +604,12 @@ class Abilities_Registrar {
 	 * @return array<string, mixed>|\WP_Error
 	 */
 	public function execute_upload_media( array $input, array $def ) {
-		$params  = Abilities_Rest_Bridge::normalize_input( $input );
+		$params = Abilities_Rest_Bridge::normalize_input( $input );
+		// Global alias maps post_id → id for /posts/{id}/… routes. Media_Manager
+		// expects post_id for the attachment parent, so map it back.
+		if ( isset( $params['id'] ) && ! isset( $params['post_id'] ) ) {
+			$params['post_id'] = $params['id'];
+		}
 		$request = Abilities_Rest_Bridge::make_request(
 			$def['method'],
 			REST_Controller::NAMESPACE . $def['route'],

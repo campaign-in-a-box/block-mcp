@@ -35,6 +35,9 @@ class Abilities_Rest_Bridge {
 		'before_top_level'  => 'before',
 		'top_level_counter' => 'index',
 		'flat_index'        => 'index',
+		// upload-media: early ability schema used base64/alt; Media_Manager expects data_base64/alt_text.
+		'base64'            => 'data_base64',
+		'alt'               => 'alt_text',
 	);
 
 	/**

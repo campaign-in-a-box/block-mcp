@@ -4,7 +4,7 @@ Tags: blocks, rest-api, gutenberg, mcp, ai
 Requires at least: 6.0
 Tested up to: 6.9
 Requires PHP: 7.4
-Stable tag: 2.0.4
+Stable tag: 2.0.5
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -119,6 +119,13 @@ Visit Settings → Block MCP. Set the score for a namespace to less than 10 to m
 `uninstall.php` deletes all plugin options and transients (`gk_block_api_preferences`, `gk_block_api_post_types_allowlist`, `gk_block_api_storage_modes`, the manual dual-storage list, the inventory cache, and per-post rate-limit transients). Post content and revisions are not touched.
 
 == Changelog ==
+
+= 2.0.5 on July 19, 2026 =
+
+#### 🐛 Fixed
+
+* Fixes `gk-block-mcp/upload-media` advertising `base64` / `alt` while the upload engine expects `data_base64` / `alt_text` (schema-following agents got `missing_file`). Schema now documents the real keys; legacy names still work as aliases. Prefer `url` sideload when the file is publicly reachable.
+* Fixes `post_id` on upload-media being dropped by the global `post_id` → `id` alias, so parent attachment works again.
 
 = 2.0.4 on June 20, 2026 =
 
