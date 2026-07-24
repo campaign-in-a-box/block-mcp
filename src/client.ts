@@ -957,6 +957,53 @@ export class WordPressBlockClient {
     return response.data;
   }
 
+  /** Start a chunked media upload session. */
+  async beginChunkedMediaUpload(args: Record<string, unknown>): Promise<{ upload_id: string; expires_in: number }> {
+    const response = await this.client.post<{ upload_id: string; expires_in: number }>(
+      '/media/chunked/begin',
+      args,
+    );
+    return response.data;
+  }
+
+  /** Append one decoded-binary chunk (base64-encoded in the request). */
+  async appendChunkedMediaUpload(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const uploadId = String(args.upload_id ?? '');
+    if (!uploadId) {
+      throw new Error('upload_media_chunk: upload_id is required');
+    }
+    const body = { ...args };
+    delete body.upload_id;
+    const response = await this.client.post<Record<string, unknown>>(
+      `/media/chunked/${uploadId}/chunk`,
+      body,
+    );
+    return response.data;
+  }
+
+  /** Assemble chunks, verify MD5, create attachment. */
+  async finishChunkedMediaUpload(uploadId: string): Promise<UploadMediaResponse> {
+    if (!uploadId) {
+      throw new Error('upload_media_finish: upload_id is required');
+    }
+    const response = await this.client.post<UploadMediaResponse>(
+      `/media/chunked/${uploadId}/finish`,
+      {},
+    );
+    return response.data;
+  }
+
+  /** Abort a chunked upload session. */
+  async abortChunkedMediaUpload(uploadId: string): Promise<{ success: boolean; upload_id: string }> {
+    if (!uploadId) {
+      throw new Error('upload_media_abort: upload_id is required');
+    }
+    const response = await this.client.delete<{ success: boolean; upload_id: string }>(
+      `/media/chunked/${uploadId}`,
+    );
+    return response.data;
+  }
+
   // ──────────────────────────────────────────────────────────
   // v1.3 — Yoast SEO metadata (gk-block-api/v1/yoast/...)
   //

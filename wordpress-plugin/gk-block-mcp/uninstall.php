@@ -23,6 +23,34 @@ require_once __DIR__ . '/includes/class-agent-provisioner.php';
 require_once __DIR__ . '/includes/class-connections.php';
 
 /**
+ * Recursively remove a directory (chunked-upload temp root on uninstall).
+ *
+ * @param string $dir Absolute path.
+ * @return void
+ */
+function gk_block_api_rrmdir( $dir ) {
+	if ( ! is_dir( $dir ) ) {
+		return;
+	}
+	$entries = @scandir( $dir ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+	if ( ! is_array( $entries ) ) {
+		return;
+	}
+	foreach ( $entries as $entry ) {
+		if ( '.' === $entry || '..' === $entry ) {
+			continue;
+		}
+		$path = $dir . '/' . $entry;
+		if ( is_dir( $path ) ) {
+			gk_block_api_rrmdir( $path );
+		} elseif ( is_file( $path ) ) {
+			@unlink( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.unlink_unlink
+		}
+	}
+	@rmdir( $dir ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_rmdir
+}
+
+/**
  * Delete every plugin option / transient on the current blog.
  *
  * Called once per blog inside switch_to_blog() on multisite, and once on
@@ -35,6 +63,15 @@ function gk_block_api_uninstall_blog() {
 	delete_option( 'gk_block_api_post_types_allowlist' );
 	delete_option( 'gk_block_api_uploads_enabled' );
 	delete_option( 'gk_block_api_allow_trash' );
+
+	// In-flight chunked upload sessions under uploads/gk-block-mcp-uploads/.
+	$uploads = wp_upload_dir();
+	if ( empty( $uploads['error'] ) && ! empty( $uploads['basedir'] ) ) {
+		$chunk_root = trailingslashit( $uploads['basedir'] ) . 'gk-block-mcp-uploads';
+		if ( is_dir( $chunk_root ) ) {
+			gk_block_api_rrmdir( $chunk_root );
+		}
+	}
 
 	// Revoke any own-account credentials (Application Passwords minted on real
 	// users for "use my own account" connections) BEFORE dropping the meta that

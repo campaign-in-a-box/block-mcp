@@ -910,6 +910,64 @@ class REST_Controller {
 			)
 		);
 
+		register_rest_route(
+			self::NAMESPACE,
+			'/media/chunked/begin',
+			array(
+				'methods'             => \WP_REST_Server::CREATABLE,
+				'callback'            => array( $this, 'begin_chunked_upload' ),
+				'permission_callback' => array( $this, 'check_upload_permissions' ),
+			)
+		);
+
+		register_rest_route(
+			self::NAMESPACE,
+			'/media/chunked/(?P<upload_id>[a-f0-9-]{36})/chunk',
+			array(
+				'methods'             => \WP_REST_Server::CREATABLE,
+				'callback'            => array( $this, 'append_chunked_upload' ),
+				'permission_callback' => array( $this, 'check_upload_permissions' ),
+				'args'                => array(
+					'upload_id' => array(
+						'type'     => 'string',
+						'required' => true,
+					),
+				),
+			)
+		);
+
+		register_rest_route(
+			self::NAMESPACE,
+			'/media/chunked/(?P<upload_id>[a-f0-9-]{36})/finish',
+			array(
+				'methods'             => \WP_REST_Server::CREATABLE,
+				'callback'            => array( $this, 'finish_chunked_upload' ),
+				'permission_callback' => array( $this, 'check_upload_permissions' ),
+				'args'                => array(
+					'upload_id' => array(
+						'type'     => 'string',
+						'required' => true,
+					),
+				),
+			)
+		);
+
+		register_rest_route(
+			self::NAMESPACE,
+			'/media/chunked/(?P<upload_id>[a-f0-9-]{36})',
+			array(
+				'methods'             => \WP_REST_Server::DELETABLE,
+				'callback'            => array( $this, 'abort_chunked_upload' ),
+				'permission_callback' => array( $this, 'check_upload_permissions' ),
+				'args'                => array(
+					'upload_id' => array(
+						'type'     => 'string',
+						'required' => true,
+					),
+				),
+			)
+		);
+
 		// Per-site MCP serverInfo instructions addendum. PUBLIC: the value
 		// reaches every connected MCP client at handshake before any
 		// tool-call auth, so this endpoint must be readable unauthenticated.
@@ -1129,6 +1187,81 @@ class REST_Controller {
 				$args['file_field'] = (string) $first;
 			}
 			$result = $this->media_manager->upload( (array) $args );
+			if ( is_wp_error( $result ) ) {
+				return $result;
+			}
+			return rest_ensure_response( $result );
+		} catch ( \Throwable $e ) {
+			return $this->handle_error( $e );
+		}
+	}
+
+	/**
+	 * POST /media/chunked/begin
+	 *
+	 * @param \WP_REST_Request $request Request object.
+	 * @return \WP_REST_Response|\WP_Error
+	 */
+	public function begin_chunked_upload( $request ) {
+		try {
+			$result = $this->media_manager->begin_chunked_upload( (array) $request->get_params() );
+			if ( is_wp_error( $result ) ) {
+				return $result;
+			}
+			return rest_ensure_response( $result );
+		} catch ( \Throwable $e ) {
+			return $this->handle_error( $e );
+		}
+	}
+
+	/**
+	 * POST /media/chunked/{upload_id}/chunk
+	 *
+	 * @param \WP_REST_Request $request Request object.
+	 * @return \WP_REST_Response|\WP_Error
+	 */
+	public function append_chunked_upload( $request ) {
+		try {
+			$upload_id = (string) $request->get_param( 'upload_id' );
+			$args      = $request->get_params();
+			unset( $args['upload_id'] );
+			$result = $this->media_manager->append_chunk( $upload_id, (array) $args );
+			if ( is_wp_error( $result ) ) {
+				return $result;
+			}
+			return rest_ensure_response( $result );
+		} catch ( \Throwable $e ) {
+			return $this->handle_error( $e );
+		}
+	}
+
+	/**
+	 * POST /media/chunked/{upload_id}/finish
+	 *
+	 * @param \WP_REST_Request $request Request object.
+	 * @return \WP_REST_Response|\WP_Error
+	 */
+	public function finish_chunked_upload( $request ) {
+		try {
+			$result = $this->media_manager->finish_chunked_upload( (string) $request->get_param( 'upload_id' ) );
+			if ( is_wp_error( $result ) ) {
+				return $result;
+			}
+			return rest_ensure_response( $result );
+		} catch ( \Throwable $e ) {
+			return $this->handle_error( $e );
+		}
+	}
+
+	/**
+	 * DELETE /media/chunked/{upload_id}
+	 *
+	 * @param \WP_REST_Request $request Request object.
+	 * @return \WP_REST_Response|\WP_Error
+	 */
+	public function abort_chunked_upload( $request ) {
+		try {
+			$result = $this->media_manager->abort_chunked_upload( (string) $request->get_param( 'upload_id' ) );
 			if ( is_wp_error( $result ) ) {
 				return $result;
 			}

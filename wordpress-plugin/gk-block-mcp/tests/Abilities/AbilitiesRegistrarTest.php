@@ -207,4 +207,25 @@ class AbilitiesRegistrarTest extends RestControllerTestCase {
 		$this->assertArrayNotHasKey( 'base64', $normalized );
 		$this->assertArrayNotHasKey( 'alt', $normalized );
 	}
+
+	/**
+	 * Chunked upload abilities must be registered alongside upload-media.
+	 */
+	public function test_chunked_upload_abilities_registered(): void {
+		foreach ( array(
+			'gk-block-mcp/upload-media-begin',
+			'gk-block-mcp/upload-media-chunk',
+			'gk-block-mcp/upload-media-finish',
+			'gk-block-mcp/upload-media-abort',
+		) as $name ) {
+			$ability = wp_get_ability( $name );
+			$this->assertNotNull( $ability, $name . ' should be registered' );
+		}
+
+		$begin = wp_get_ability( 'gk-block-mcp/upload-media-begin' );
+		$schema = $begin->get_input_schema();
+		$properties = isset( $schema['properties'] ) && is_array( $schema['properties'] ) ? $schema['properties'] : array();
+		$this->assertArrayHasKey( 'content_md5', $properties );
+		$this->assertArrayHasKey( 'filename', $properties );
+	}
 }

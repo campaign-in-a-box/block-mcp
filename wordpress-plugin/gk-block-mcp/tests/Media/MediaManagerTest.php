@@ -69,6 +69,18 @@ class MediaManagerTest extends WP_UnitTestCase {
 		$this->assertSame( 'invalid_base64', $result->get_error_code() );
 	}
 
+	public function test_base64_accepts_data_uri_and_whitespace() {
+		$png    = file_get_contents( __DIR__ . '/../fixtures/sample.png' );
+		$b64    = chunk_split( base64_encode( $png ), 76, "\n" );
+		$result = $this->mm->upload( array(
+			'data_base64' => 'data:image/png;base64,' . $b64,
+			'filename'    => 'sample.png',
+		) );
+		$this->assertIsArray( $result, is_object( $result ) ? $result->get_error_message() : '' );
+		$this->assertTrue( $result['success'] );
+		$this->assertSame( 'image/png', $result['mime_type'] );
+	}
+
 	public function test_base64_rejects_disallowed_mime() {
 		$result = $this->mm->upload( array(
 			'data_base64' => base64_encode( '<?php echo "x"; ?>' ),
@@ -229,5 +241,126 @@ class MediaManagerTest extends WP_UnitTestCase {
 		$result = $this->mm->upload( array( 'url' => 'http://127.0.0.1/x.png' ) );
 		$this->assertInstanceOf( \WP_Error::class, $result );
 		$this->assertSame( 'invalid_url', $result->get_error_code() );
+	}
+
+	// ── chunked base64 path ──
+
+	public function test_chunked_happy_path() {
+		$png  = file_get_contents( __DIR__ . '/../fixtures/sample.png' );
+		$md5  = md5( $png );
+		$size = strlen( $png );
+
+		$begin = $this->mm->begin_chunked_upload( array(
+			'filename'    => 'chunked.png',
+			'content_md5' => $md5,
+			'byte_size'   => $size,
+			'alt_text'    => 'chunked-alt',
+			'title'       => 'Chunked',
+		) );
+		$this->assertIsArray( $begin, is_object( $begin ) ? $begin->get_error_message() : '' );
+		$upload_id = $begin['upload_id'];
+
+		// Split into ~40-byte raw chunks so we exercise multiple indexes.
+		$chunk_size = 40;
+		$index      = 0;
+		for ( $offset = 0; $offset < $size; $offset += $chunk_size ) {
+			$piece = substr( $png, $offset, $chunk_size );
+			$res   = $this->mm->append_chunk( $upload_id, array(
+				'index'       => $index,
+				'data_base64' => base64_encode( $piece ),
+			) );
+			$this->assertIsArray( $res, is_object( $res ) ? $res->get_error_message() : '' );
+			++$index;
+		}
+
+		$result = $this->mm->finish_chunked_upload( $upload_id );
+		$this->assertIsArray( $result, is_object( $result ) ? $result->get_error_message() : '' );
+		$this->assertTrue( $result['success'] );
+		$this->assertSame( 'image/png', $result['mime_type'] );
+		$this->assertSame( 'chunked-alt', $result['alt_text'] );
+		$this->assertSame( 'Chunked', $result['title'] );
+
+		// Session dir must be gone after finish.
+		$uploads = wp_upload_dir();
+		$session = trailingslashit( $uploads['basedir'] ) . Media_Manager::CHUNKED_UPLOAD_DIR . '/' . $upload_id;
+		$this->assertFalse( is_dir( $session ) );
+	}
+
+	public function test_chunked_checksum_mismatch() {
+		$png = file_get_contents( __DIR__ . '/../fixtures/sample.png' );
+		$begin = $this->mm->begin_chunked_upload( array(
+			'filename'    => 'bad.png',
+			'content_md5' => str_repeat( 'a', 32 ),
+		) );
+		$this->assertIsArray( $begin );
+		$upload_id = $begin['upload_id'];
+
+		$this->mm->append_chunk( $upload_id, array(
+			'index'       => 0,
+			'data_base64' => base64_encode( $png ),
+		) );
+		$result = $this->mm->finish_chunked_upload( $upload_id );
+		$this->assertInstanceOf( \WP_Error::class, $result );
+		$this->assertSame( 'checksum_mismatch', $result->get_error_code() );
+
+		$uploads = wp_upload_dir();
+		$session = trailingslashit( $uploads['basedir'] ) . Media_Manager::CHUNKED_UPLOAD_DIR . '/' . $upload_id;
+		$this->assertFalse( is_dir( $session ) );
+	}
+
+	public function test_chunked_incomplete_upload() {
+		$png = file_get_contents( __DIR__ . '/../fixtures/sample.png' );
+		$begin = $this->mm->begin_chunked_upload( array(
+			'filename'    => 'gap.png',
+			'content_md5' => md5( $png ),
+		) );
+		$upload_id = $begin['upload_id'];
+
+		// Only send index 1 — missing 0.
+		$this->mm->append_chunk( $upload_id, array(
+			'index'       => 1,
+			'data_base64' => base64_encode( substr( $png, 0, 10 ) ),
+		) );
+		$result = $this->mm->finish_chunked_upload( $upload_id );
+		$this->assertInstanceOf( \WP_Error::class, $result );
+		$this->assertSame( 'incomplete_upload', $result->get_error_code() );
+	}
+
+	public function test_chunked_abort_deletes_session() {
+		$begin = $this->mm->begin_chunked_upload( array(
+			'filename'    => 'abort.png',
+			'content_md5' => md5( 'x' ),
+		) );
+		$upload_id = $begin['upload_id'];
+		$uploads   = wp_upload_dir();
+		$session   = trailingslashit( $uploads['basedir'] ) . Media_Manager::CHUNKED_UPLOAD_DIR . '/' . $upload_id;
+		$this->assertTrue( is_dir( $session ) );
+
+		$abort = $this->mm->abort_chunked_upload( $upload_id );
+		$this->assertIsArray( $abort );
+		$this->assertTrue( $abort['success'] );
+		$this->assertFalse( is_dir( $session ) );
+	}
+
+	public function test_chunked_ttl_expires_on_access() {
+		$begin = $this->mm->begin_chunked_upload( array(
+			'filename'    => 'old.png',
+			'content_md5' => md5( 'x' ),
+		) );
+		$upload_id = $begin['upload_id'];
+		$uploads   = wp_upload_dir();
+		$session   = trailingslashit( $uploads['basedir'] ) . Media_Manager::CHUNKED_UPLOAD_DIR . '/' . $upload_id;
+		$meta_path = $session . '/meta.json';
+		$meta      = json_decode( file_get_contents( $meta_path ), true );
+		$meta['created_at'] = time() - Media_Manager::CHUNKED_UPLOAD_TTL - 10;
+		file_put_contents( $meta_path, wp_json_encode( $meta ) );
+
+		$result = $this->mm->append_chunk( $upload_id, array(
+			'index'       => 0,
+			'data_base64' => base64_encode( 'x' ),
+		) );
+		$this->assertInstanceOf( \WP_Error::class, $result );
+		$this->assertSame( 'upload_expired', $result->get_error_code() );
+		$this->assertFalse( is_dir( $session ) );
 	}
 }

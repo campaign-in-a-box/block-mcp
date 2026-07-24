@@ -2,14 +2,21 @@
 /**
  * Media library uploads.
  *
- * Three input modes (mutually exclusive — exactly one required):
+ * Three single-shot input modes (mutually exclusive — exactly one required):
  *  1. multipart form-data — caller sets $args['file_field'] to the form-data
  *     field name; the file appears in $_FILES.
  *  2. URL sideload — caller passes $args['url']. Server downloads via WP HTTP
  *     and writes to uploads.
  *  3. Base64 inline — caller passes $args['data_base64'] (and required
  *     $args['filename']). Decoded server-side, written to a temp file,
- *     then sideloaded.
+ *     then sideloaded. Practical only for tiny files when the caller is an
+ *     LLM (tool-arg truncation yields invalid_base64); prefer url or the
+ *     chunked begin/chunk/finish flow for anything larger.
+ *
+ * Chunked base64 (begin → chunk → finish) stores decoded binary pieces under
+ * uploads/gk-block-mcp-uploads/{upload_id}/, verifies an end-to-end MD5 on
+ * finish, then sideloads. Sessions wipe on finish/abort and on TTL expiry
+ * when next accessed.
  *
  * @package GravityKit\BlockMCP
  */
@@ -27,8 +34,14 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 class Media_Manager {
 
-	/** Default size cap for URL sideloads (25 MB). */
+	/** Default size cap for URL sideloads / base64 / chunked assemble (25 MB). */
 	const URL_DOWNLOAD_MAX_BYTES = 26214400;
+
+	/** Chunked upload session TTL (seconds). Expired sessions delete on next access. */
+	const CHUNKED_UPLOAD_TTL = 3600;
+
+	/** Subdir under uploads for in-flight chunked sessions. */
+	const CHUNKED_UPLOAD_DIR = 'gk-block-mcp-uploads';
 
 	/**
 	 * Reserved IP ranges to block on URL sideload (SSRF defense).
@@ -329,11 +342,42 @@ class Media_Manager {
 			return new \WP_Error( 'invalid_filename', __( '"filename" is required for base64 uploads.', 'gk-block-mcp' ), array( 'status' => 400 ) );
 		}
 
+		$decoded = $this->decode_base64_payload( (string) $args['data_base64'] );
+		if ( is_wp_error( $decoded ) ) {
+			return $decoded;
+		}
+
+		$cap_err = $this->enforce_decoded_size_cap( $decoded );
+		if ( is_wp_error( $cap_err ) ) {
+			return $cap_err;
+		}
+
+		return $this->sideload_decoded_bytes(
+			$decoded,
+			sanitize_file_name( (string) $args['filename'] ),
+			isset( $args['post_id'] ) ? (int) $args['post_id'] : 0
+		);
+	}
+
+	/**
+	 * Normalize and decode a base64 payload (data-URI + whitespace tolerant).
+	 *
+	 * @param string $raw Caller-supplied base64 (or data:…;base64,…).
+	 * @return string|\WP_Error Decoded binary bytes or WP_Error.
+	 */
+	private function decode_base64_payload( $raw ) {
+		$normalized = $this->normalize_base64_payload( $raw );
+		if ( '' === $normalized ) {
+			return new \WP_Error(
+				'invalid_base64',
+				__( 'data_base64 is empty after normalization. If this was a larger file, the payload was likely truncated in transit — prefer url sideload or the chunked upload-media-begin/chunk/finish flow.', 'gk-block-mcp' ),
+				array( 'status' => 400 )
+			);
+		}
+
 		// Bound the encoded payload BEFORE decoding to limit memory consumption.
-		// Base64 expands 3 bytes → 4 bytes, so the encoded length cap matches the
-		// decoded size cap (URL_DOWNLOAD_MAX_BYTES, 25 MB).
 		$encoded_max = (int) ceil( self::URL_DOWNLOAD_MAX_BYTES * 4 / 3 );
-		if ( strlen( (string) $args['data_base64'] ) > $encoded_max ) {
+		if ( strlen( $normalized ) > $encoded_max ) {
 			return new \WP_Error(
 				'file_too_large',
 				__( 'data_base64 exceeds size cap before decoding.', 'gk-block-mcp' ),
@@ -341,21 +385,57 @@ class Media_Manager {
 			);
 		}
 
-		$decoded = base64_decode( $args['data_base64'], true ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_decode -- Caller-supplied base64 payload from REST request body.
+		$decoded = base64_decode( $normalized, true ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_decode -- Caller-supplied base64 payload from REST / MCP.
 		if ( false === $decoded || '' === $decoded ) {
-			return new \WP_Error( 'invalid_base64', __( 'data_base64 is not valid base64.', 'gk-block-mcp' ), array( 'status' => 400 ) );
+			return new \WP_Error(
+				'invalid_base64',
+				__( 'data_base64 is not valid base64 (often truncated by an LLM tool-call size limit). Prefer url sideload, or upload-media-begin → upload-media-chunk → upload-media-finish with content_md5 for larger files.', 'gk-block-mcp' ),
+				array( 'status' => 400 )
+			);
 		}
 
-		// Enforce both the URL-mode cap and the site upload limit on the decoded
-		// payload before any disk write.
+		return $decoded;
+	}
+
+	/**
+	 * Strip data-URI prefix and whitespace from a base64 string.
+	 *
+	 * @param string $raw Raw input.
+	 * @return string
+	 */
+	private function normalize_base64_payload( $raw ) {
+		$raw = (string) $raw;
+		if ( preg_match( '/^data:[^;]*;base64,/i', $raw ) ) {
+			$raw = (string) preg_replace( '/^data:[^;]*;base64,/i', '', $raw, 1 );
+		}
+		return preg_replace( '/\s+/', '', $raw ) ?? '';
+	}
+
+	/**
+	 * Enforce URL_DOWNLOAD_MAX_BYTES and wp_max_upload_size on decoded bytes.
+	 *
+	 * @param string $decoded Binary payload.
+	 * @return true|\WP_Error
+	 */
+	private function enforce_decoded_size_cap( $decoded ) {
 		$max = function_exists( 'wp_max_upload_size' ) ? (int) wp_max_upload_size() : 0;
 		$cap = $max > 0 ? min( $max, self::URL_DOWNLOAD_MAX_BYTES ) : self::URL_DOWNLOAD_MAX_BYTES;
 		if ( strlen( $decoded ) > $cap ) {
 			return new \WP_Error( 'file_too_large', __( 'Decoded data exceeds size cap.', 'gk-block-mcp' ), array( 'status' => 400 ) );
 		}
+		return true;
+	}
 
-		$filename = sanitize_file_name( (string) $args['filename'] );
-		$tmp      = wp_tempnam( $filename );
+	/**
+	 * Write decoded bytes to a temp file and media_handle_sideload them.
+	 *
+	 * @param string $decoded  Binary file contents.
+	 * @param string $filename Sanitized filename.
+	 * @param int    $post_parent Parent post ID (0 = none).
+	 * @return int|\WP_Error Attachment ID or WP_Error.
+	 */
+	private function sideload_decoded_bytes( $decoded, $filename, $post_parent = 0 ) {
+		$tmp = wp_tempnam( $filename );
 		if ( ! $tmp ) {
 			return new \WP_Error( 'sideload_failed', __( 'Could not create temp file.', 'gk-block-mcp' ), array( 'status' => 500 ) );
 		}
@@ -371,7 +451,6 @@ class Media_Manager {
 			return new \WP_Error( 'disallowed_mime', sprintf( /* translators: %s: filename */ __( 'Disallowed file type for "%s".', 'gk-block-mcp' ), $filename ), array( 'status' => 400 ) );
 		}
 
-		$post_parent   = isset( $args['post_id'] ) ? (int) $args['post_id'] : 0;
 		$file          = array(
 			'name'     => $filename,
 			'tmp_name' => $tmp,
@@ -710,6 +789,464 @@ class Media_Manager {
 		}
 		$mask = str_pad( $mask, 16, "\x00" );
 		return ( $ip_packed & $mask ) === ( $net_packed & $mask );
+	}
+
+	// -------------------------------------------------------------------------
+	// Chunked base64 upload (begin → chunk → finish / abort)
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Start a chunked upload session.
+	 *
+	 * @param array $args {
+	 *     @type string $filename     Required.
+	 *     @type string $content_md5  Required. Hex MD5 of the raw file bytes.
+	 *     @type int    $byte_size    Optional. Expected decoded byte length.
+	 *     @type string $title        Optional metadata.
+	 *     @type string $alt_text     Optional.
+	 *     @type string $caption      Optional.
+	 *     @type string $description  Optional.
+	 *     @type int    $post_id      Optional parent post.
+	 * }
+	 * @return array|\WP_Error { upload_id, expires_in }
+	 */
+	public function begin_chunked_upload( array $args ) {
+		if ( ! self::uploads_enabled() ) {
+			return new \WP_Error(
+				'uploads_disabled',
+				__( 'Media uploads via the block API are disabled on this site.', 'gk-block-mcp' ),
+				array( 'status' => 403 )
+			);
+		}
+
+		$filename = isset( $args['filename'] ) ? sanitize_file_name( (string) $args['filename'] ) : '';
+		if ( '' === $filename ) {
+			return new \WP_Error( 'invalid_filename', __( '"filename" is required for chunked uploads.', 'gk-block-mcp' ), array( 'status' => 400 ) );
+		}
+
+		$content_md5 = isset( $args['content_md5'] ) ? strtolower( preg_replace( '/[^a-f0-9]/i', '', (string) $args['content_md5'] ) ?? '' ) : '';
+		if ( 32 !== strlen( $content_md5 ) ) {
+			return new \WP_Error(
+				'invalid_checksum',
+				__( '"content_md5" must be a 32-character hex MD5 of the raw file bytes.', 'gk-block-mcp' ),
+				array( 'status' => 400 )
+			);
+		}
+
+		$byte_size = isset( $args['byte_size'] ) ? absint( $args['byte_size'] ) : 0;
+		if ( $byte_size > 0 ) {
+			$max = function_exists( 'wp_max_upload_size' ) ? (int) wp_max_upload_size() : 0;
+			$cap = $max > 0 ? min( $max, self::URL_DOWNLOAD_MAX_BYTES ) : self::URL_DOWNLOAD_MAX_BYTES;
+			if ( $byte_size > $cap ) {
+				return new \WP_Error( 'file_too_large', __( 'byte_size exceeds size cap.', 'gk-block-mcp' ), array( 'status' => 400 ) );
+			}
+		}
+
+		$root = $this->chunked_uploads_root();
+		if ( is_wp_error( $root ) ) {
+			return $root;
+		}
+
+		$upload_id = wp_generate_uuid4();
+		$session   = $root . '/' . $upload_id;
+		if ( ! wp_mkdir_p( $session ) ) {
+			return new \WP_Error( 'session_create_failed', __( 'Could not create upload session directory.', 'gk-block-mcp' ), array( 'status' => 500 ) );
+		}
+
+		$meta = array(
+			'upload_id'   => $upload_id,
+			'created_at'  => time(),
+			'user_id'     => get_current_user_id(),
+			'filename'    => $filename,
+			'content_md5' => $content_md5,
+			'byte_size'   => $byte_size,
+			'title'       => isset( $args['title'] ) ? (string) $args['title'] : null,
+			'alt_text'    => isset( $args['alt_text'] ) ? (string) $args['alt_text'] : null,
+			'caption'     => isset( $args['caption'] ) ? (string) $args['caption'] : null,
+			'description' => isset( $args['description'] ) ? (string) $args['description'] : null,
+			'post_id'     => isset( $args['post_id'] ) ? absint( $args['post_id'] ) : 0,
+			'chunks'      => array(),
+		);
+
+		if ( ! $this->write_session_meta( $session, $meta ) ) {
+			$this->delete_session_dir( $session );
+			return new \WP_Error( 'session_create_failed', __( 'Could not write upload session metadata.', 'gk-block-mcp' ), array( 'status' => 500 ) );
+		}
+
+		return array(
+			'upload_id'  => $upload_id,
+			'expires_in' => self::CHUNKED_UPLOAD_TTL,
+		);
+	}
+
+	/**
+	 * Append one base64-encoded chunk (decoded to binary on disk).
+	 *
+	 * Chunk the **raw file bytes**, then base64-encode each piece separately
+	 * (do not split a single base64 string). Recommended ~2–3 KB of raw bytes
+	 * per chunk so LLM tool calls stay reliable.
+	 *
+	 * @param string $upload_id Session id from begin_chunked_upload.
+	 * @param array  $args {
+	 *     @type int    $index       Required. Zero-based contiguous index.
+	 *     @type string $data_base64 Required. Base64 of this chunk's raw bytes.
+	 * }
+	 * @return array|\WP_Error { upload_id, index, bytes, chunk_count }
+	 */
+	public function append_chunk( $upload_id, array $args ) {
+		$session = $this->resolve_writable_session( $upload_id );
+		if ( is_wp_error( $session ) ) {
+			return $session;
+		}
+
+		$meta = $this->read_session_meta( $session );
+		if ( is_wp_error( $meta ) ) {
+			$this->delete_session_dir( $session );
+			return $meta;
+		}
+
+		if ( ! array_key_exists( 'index', $args ) || ! is_numeric( $args['index'] ) ) {
+			return new \WP_Error( 'missing_params', __( '"index" is required for each chunk (non-negative integer).', 'gk-block-mcp' ), array( 'status' => 400 ) );
+		}
+		$index = (int) $args['index'];
+		if ( $index < 0 || (string) $index !== (string) (int) $args['index'] ) {
+			return new \WP_Error( 'invalid_index', __( '"index" must be a non-negative integer.', 'gk-block-mcp' ), array( 'status' => 400 ) );
+		}
+
+		if ( in_array( $index, $meta['chunks'], true ) ) {
+			return new \WP_Error( 'duplicate_chunk', __( 'That chunk index was already received.', 'gk-block-mcp' ), array( 'status' => 400 ) );
+		}
+
+		if ( empty( $args['data_base64'] ) || ! is_string( $args['data_base64'] ) ) {
+			return new \WP_Error( 'missing_params', __( '"data_base64" is required for each chunk.', 'gk-block-mcp' ), array( 'status' => 400 ) );
+		}
+
+		$decoded = $this->decode_base64_payload( $args['data_base64'] );
+		if ( is_wp_error( $decoded ) ) {
+			return $decoded;
+		}
+
+		// Running total must stay under the site cap.
+		$so_far = $this->session_assembled_bytes( $session, $meta['chunks'] );
+		if ( is_wp_error( $so_far ) ) {
+			$this->delete_session_dir( $session );
+			return $so_far;
+		}
+		$projected = $so_far + strlen( $decoded );
+		$max       = function_exists( 'wp_max_upload_size' ) ? (int) wp_max_upload_size() : 0;
+		$cap       = $max > 0 ? min( $max, self::URL_DOWNLOAD_MAX_BYTES ) : self::URL_DOWNLOAD_MAX_BYTES;
+		if ( $projected > $cap ) {
+			return new \WP_Error( 'file_too_large', __( 'Chunked upload exceeds size cap.', 'gk-block-mcp' ), array( 'status' => 400 ) );
+		}
+		if ( ! empty( $meta['byte_size'] ) && $projected > (int) $meta['byte_size'] ) {
+			return new \WP_Error(
+				'byte_size_exceeded',
+				__( 'Received bytes exceed the byte_size declared at begin.', 'gk-block-mcp' ),
+				array( 'status' => 400 )
+			);
+		}
+
+		$chunk_path = $this->chunk_path( $session, $index );
+		$written    = file_put_contents( $chunk_path, $decoded ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
+		if ( false === $written ) {
+			return new \WP_Error( 'chunk_write_failed', __( 'Could not write chunk to disk.', 'gk-block-mcp' ), array( 'status' => 500 ) );
+		}
+
+		$meta['chunks'][] = $index;
+		sort( $meta['chunks'], SORT_NUMERIC );
+		if ( ! $this->write_session_meta( $session, $meta ) ) {
+			wp_delete_file( $chunk_path );
+			return new \WP_Error( 'session_update_failed', __( 'Could not update upload session metadata.', 'gk-block-mcp' ), array( 'status' => 500 ) );
+		}
+
+		return array(
+			'upload_id'   => $meta['upload_id'],
+			'index'       => $index,
+			'bytes'       => strlen( $decoded ),
+			'chunk_count' => count( $meta['chunks'] ),
+		);
+	}
+
+	/**
+	 * Assemble chunks, verify MD5, sideload into the media library.
+	 *
+	 * @param string $upload_id Session id.
+	 * @return array|\WP_Error Same shape as upload() on success.
+	 */
+	public function finish_chunked_upload( $upload_id ) {
+		$session = $this->resolve_writable_session( $upload_id );
+		if ( is_wp_error( $session ) ) {
+			return $session;
+		}
+
+		$meta = $this->read_session_meta( $session );
+		if ( is_wp_error( $meta ) ) {
+			$this->delete_session_dir( $session );
+			return $meta;
+		}
+
+		$chunks = $meta['chunks'];
+		if ( empty( $chunks ) ) {
+			$this->delete_session_dir( $session );
+			return new \WP_Error( 'incomplete_upload', __( 'No chunks were received.', 'gk-block-mcp' ), array( 'status' => 400 ) );
+		}
+
+		$max_index = max( $chunks );
+		for ( $i = 0; $i <= $max_index; $i++ ) {
+			if ( ! in_array( $i, $chunks, true ) ) {
+				$this->delete_session_dir( $session );
+				return new \WP_Error(
+					'incomplete_upload',
+					sprintf(
+						/* translators: %d: missing chunk index */
+						__( 'Missing chunk index %d (indexes must be contiguous from 0).', 'gk-block-mcp' ),
+						$i
+					),
+					array( 'status' => 400 )
+				);
+			}
+		}
+
+		$assembled = '';
+		for ( $i = 0; $i <= $max_index; $i++ ) {
+			$path = $this->chunk_path( $session, $i );
+			if ( ! is_readable( $path ) ) {
+				$this->delete_session_dir( $session );
+				return new \WP_Error( 'incomplete_upload', __( 'A chunk file is missing on disk.', 'gk-block-mcp' ), array( 'status' => 400 ) );
+			}
+			$piece = file_get_contents( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents
+			if ( false === $piece ) {
+				$this->delete_session_dir( $session );
+				return new \WP_Error( 'assemble_failed', __( 'Could not read a chunk file.', 'gk-block-mcp' ), array( 'status' => 500 ) );
+			}
+			$assembled .= $piece;
+		}
+
+		if ( ! empty( $meta['byte_size'] ) && strlen( $assembled ) !== (int) $meta['byte_size'] ) {
+			$this->delete_session_dir( $session );
+			return new \WP_Error(
+				'byte_size_mismatch',
+				__( 'Assembled byte length does not match byte_size from begin.', 'gk-block-mcp' ),
+				array( 'status' => 400 )
+			);
+		}
+
+		$actual_md5 = md5( $assembled );
+		if ( ! hash_equals( (string) $meta['content_md5'], $actual_md5 ) ) {
+			$this->delete_session_dir( $session );
+			return new \WP_Error(
+				'checksum_mismatch',
+				__( 'Assembled file MD5 does not match content_md5 from begin.', 'gk-block-mcp' ),
+				array( 'status' => 400 )
+			);
+		}
+
+		$cap_err = $this->enforce_decoded_size_cap( $assembled );
+		if ( is_wp_error( $cap_err ) ) {
+			$this->delete_session_dir( $session );
+			return $cap_err;
+		}
+
+		$this->require_admin_includes();
+		$attachment_id = $this->sideload_decoded_bytes(
+			$assembled,
+			(string) $meta['filename'],
+			(int) $meta['post_id']
+		);
+
+		// Wipe session before returning either success or sideload error.
+		$meta_for_apply = $meta;
+		$this->delete_session_dir( $session );
+
+		if ( is_wp_error( $attachment_id ) ) {
+			return $attachment_id;
+		}
+
+		$apply_args = array();
+		foreach ( array( 'title', 'alt_text', 'caption', 'description' ) as $key ) {
+			if ( null !== $meta_for_apply[ $key ] ) {
+				$apply_args[ $key ] = $meta_for_apply[ $key ];
+			}
+		}
+		$this->apply_metadata( (int) $attachment_id, $apply_args );
+
+		return $this->format_attachment( (int) $attachment_id );
+	}
+
+	/**
+	 * Abort and delete a chunked upload session.
+	 *
+	 * @param string $upload_id Session id.
+	 * @return array|\WP_Error { success, upload_id }
+	 */
+	public function abort_chunked_upload( $upload_id ) {
+		$session = $this->resolve_writable_session( $upload_id );
+		if ( is_wp_error( $session ) ) {
+			return $session;
+		}
+		$this->delete_session_dir( $session );
+		return array(
+			'success'   => true,
+			'upload_id' => (string) $upload_id,
+		);
+	}
+
+	/**
+	 * Absolute path to the chunked-uploads root under wp uploads.
+	 *
+	 * @return string|\WP_Error
+	 */
+	private function chunked_uploads_root() {
+		$uploads = wp_upload_dir();
+		if ( ! empty( $uploads['error'] ) ) {
+			return new \WP_Error( 'upload_dir_error', (string) $uploads['error'], array( 'status' => 500 ) );
+		}
+		$root = trailingslashit( $uploads['basedir'] ) . self::CHUNKED_UPLOAD_DIR;
+		if ( ! wp_mkdir_p( $root ) ) {
+			return new \WP_Error( 'session_create_failed', __( 'Could not create chunked uploads directory.', 'gk-block-mcp' ), array( 'status' => 500 ) );
+		}
+		return $root;
+	}
+
+	/**
+	 * Resolve upload_id to a session dir the current user may write.
+	 * Deletes and errors if the session is past TTL.
+	 *
+	 * @param string $upload_id UUID.
+	 * @return string|\WP_Error Absolute session directory.
+	 */
+	private function resolve_writable_session( $upload_id ) {
+		$upload_id = (string) $upload_id;
+		if ( ! preg_match( '/^[a-f0-9-]{36}$/i', $upload_id ) ) {
+			return new \WP_Error( 'invalid_upload_id', __( 'Invalid upload_id.', 'gk-block-mcp' ), array( 'status' => 400 ) );
+		}
+
+		$root = $this->chunked_uploads_root();
+		if ( is_wp_error( $root ) ) {
+			return $root;
+		}
+
+		$session = $root . '/' . $upload_id;
+		if ( ! is_dir( $session ) ) {
+			return new \WP_Error( 'upload_not_found', __( 'Upload session not found.', 'gk-block-mcp' ), array( 'status' => 404 ) );
+		}
+
+		$meta = $this->read_session_meta( $session );
+		if ( is_wp_error( $meta ) ) {
+			$this->delete_session_dir( $session );
+			return $meta;
+		}
+
+		$age = time() - (int) $meta['created_at'];
+		if ( $age > self::CHUNKED_UPLOAD_TTL ) {
+			$this->delete_session_dir( $session );
+			return new \WP_Error( 'upload_expired', __( 'Upload session expired.', 'gk-block-mcp' ), array( 'status' => 410 ) );
+		}
+
+		$user_id = get_current_user_id();
+		$owner   = (int) $meta['user_id'];
+		if ( $owner && $user_id !== $owner && ! current_user_can( 'manage_options' ) ) {
+			return new \WP_Error( 'rest_forbidden', __( 'You do not own this upload session.', 'gk-block-mcp' ), array( 'status' => 403 ) );
+		}
+
+		return $session;
+	}
+
+	/**
+	 * @param string $session Absolute session dir.
+	 * @return array|\WP_Error
+	 */
+	private function read_session_meta( $session ) {
+		$path = $session . '/meta.json';
+		if ( ! is_readable( $path ) ) {
+			return new \WP_Error( 'upload_not_found', __( 'Upload session metadata missing.', 'gk-block-mcp' ), array( 'status' => 404 ) );
+		}
+		$raw = file_get_contents( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents
+		if ( false === $raw ) {
+			return new \WP_Error( 'session_read_failed', __( 'Could not read upload session metadata.', 'gk-block-mcp' ), array( 'status' => 500 ) );
+		}
+		$data = json_decode( $raw, true );
+		if ( ! is_array( $data ) || empty( $data['upload_id'] ) ) {
+			return new \WP_Error( 'session_corrupt', __( 'Upload session metadata is corrupt.', 'gk-block-mcp' ), array( 'status' => 500 ) );
+		}
+		if ( ! isset( $data['chunks'] ) || ! is_array( $data['chunks'] ) ) {
+			$data['chunks'] = array();
+		}
+		$data['chunks'] = array_map( 'intval', $data['chunks'] );
+		return $data;
+	}
+
+	/**
+	 * @param string $session Absolute session dir.
+	 * @param array  $meta    Session metadata.
+	 * @return bool
+	 */
+	private function write_session_meta( $session, array $meta ) {
+		$json = wp_json_encode( $meta );
+		if ( false === $json ) {
+			return false;
+		}
+		$path = $session . '/meta.json';
+		$ok   = file_put_contents( $path, $json ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
+		return false !== $ok;
+	}
+
+	/**
+	 * @param string $session Absolute session dir.
+	 * @param int    $index   Chunk index.
+	 * @return string
+	 */
+	private function chunk_path( $session, $index ) {
+		return $session . '/chunk-' . sprintf( '%05d', (int) $index ) . '.bin';
+	}
+
+	/**
+	 * @param string $session Absolute session dir.
+	 * @param int[]  $chunks  Received indexes.
+	 * @return int|\WP_Error
+	 */
+	private function session_assembled_bytes( $session, array $chunks ) {
+		$total = 0;
+		foreach ( $chunks as $index ) {
+			$path = $this->chunk_path( $session, (int) $index );
+			if ( ! is_readable( $path ) ) {
+				return new \WP_Error( 'session_corrupt', __( 'A recorded chunk file is missing.', 'gk-block-mcp' ), array( 'status' => 500 ) );
+			}
+			$size = filesize( $path );
+			if ( false === $size ) {
+				return new \WP_Error( 'session_corrupt', __( 'Could not stat a chunk file.', 'gk-block-mcp' ), array( 'status' => 500 ) );
+			}
+			$total += (int) $size;
+		}
+		return $total;
+	}
+
+	/**
+	 * Recursively delete a session directory.
+	 *
+	 * @param string $session Absolute path.
+	 * @return void
+	 */
+	private function delete_session_dir( $session ) {
+		if ( ! is_dir( $session ) ) {
+			return;
+		}
+		$entries = @scandir( $session ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		if ( is_array( $entries ) ) {
+			foreach ( $entries as $entry ) {
+				if ( '.' === $entry || '..' === $entry ) {
+					continue;
+				}
+				$path = $session . '/' . $entry;
+				if ( is_file( $path ) ) {
+					wp_delete_file( $path );
+				} elseif ( is_dir( $path ) ) {
+					$this->delete_session_dir( $path );
+				}
+			}
+		}
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_rmdir -- Session temp dir under uploads.
+		@rmdir( $session ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 	}
 
 	/**

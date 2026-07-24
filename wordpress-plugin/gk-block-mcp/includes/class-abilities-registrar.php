@@ -405,7 +405,7 @@ class Abilities_Registrar {
 			array(
 				'slug'        => 'upload-media',
 				'label'       => 'Upload media',
-				'description' => 'Upload to the media library. Prefer url (server sideloads; most efficient for agents). Use data_base64 + filename only for small local files that are not publicly reachable. Exactly one of url or data_base64.',
+				'description' => 'Upload to the media library. Prefer url (server sideloads). Use data_base64 + filename only for tiny files (~few KB) — larger base64 in a single tool call is often truncated and returns invalid_base64. For generated/local images without a public URL, use upload-media-begin → upload-media-chunk (2–3KB raw bytes each) → upload-media-finish with content_md5. Exactly one of url or data_base64.',
 				'readonly'    => false,
 				'permission'  => 'upload',
 				'input'       => array(
@@ -417,7 +417,7 @@ class Abilities_Registrar {
 						),
 						'data_base64'  => array(
 							'type'        => 'string',
-							'description' => 'Base64-encoded file bytes. Requires filename. Prefer url when possible.',
+							'description' => 'Base64-encoded file bytes for tiny files only. Requires filename. Prefer url or chunked upload for anything larger.',
 						),
 						'filename'     => array(
 							'type'        => 'string',
@@ -446,6 +446,111 @@ class Abilities_Registrar {
 				'handler'     => array( $this->controller, 'upload_media' ),
 				'method'      => 'POST',
 				'route'       => '/media',
+			),
+			array(
+				'slug'        => 'upload-media-begin',
+				'label'       => 'Begin chunked media upload',
+				'description' => 'Start a chunked media upload. Pass filename, content_md5 (hex MD5 of the raw file bytes), and optional byte_size / metadata. Returns upload_id. Then call upload-media-chunk for each piece (base64 of ~2–3KB raw bytes, indexes 0..n-1), then upload-media-finish.',
+				'readonly'    => false,
+				'permission'  => 'upload',
+				'input'       => array(
+					'type'       => 'object',
+					'properties' => array(
+						'filename'    => array(
+							'type'        => 'string',
+							'description' => 'Target filename (e.g. hero.png).',
+						),
+						'content_md5' => array(
+							'type'        => 'string',
+							'description' => '32-char hex MD5 of the complete raw file bytes (verified on finish).',
+						),
+						'byte_size'   => array(
+							'type'        => 'integer',
+							'description' => 'Optional expected decoded byte length.',
+						),
+						'title'       => array( 'type' => 'string' ),
+						'alt_text'    => array( 'type' => 'string' ),
+						'caption'     => array( 'type' => 'string' ),
+						'description' => array( 'type' => 'string' ),
+						'post_id'     => array( 'type' => 'integer' ),
+					),
+					'required'   => array( 'filename', 'content_md5' ),
+				),
+				'execute'     => array( $this, 'execute_begin_chunked_upload' ),
+				'handler'     => array( $this->controller, 'begin_chunked_upload' ),
+				'method'      => 'POST',
+				'route'       => '/media/chunked/begin',
+			),
+			array(
+				'slug'        => 'upload-media-chunk',
+				'label'       => 'Append media upload chunk',
+				'description' => 'Append one chunk to a session from upload-media-begin. Pass upload_id, index (0-based), and data_base64 (base64 of that chunk\'s raw bytes — chunk the file first, then encode each piece; do not split one big base64 string). Keep raw chunks ~2–3KB.',
+				'readonly'    => false,
+				'permission'  => 'upload',
+				'input'       => array(
+					'type'       => 'object',
+					'properties' => array(
+						'upload_id'   => array(
+							'type'        => 'string',
+							'description' => 'Session id from upload-media-begin.',
+						),
+						'index'       => array(
+							'type'        => 'integer',
+							'description' => 'Zero-based chunk index; must be contiguous from 0 with no gaps at finish.',
+						),
+						'data_base64' => array(
+							'type'        => 'string',
+							'description' => 'Base64 of this chunk\'s raw bytes.',
+						),
+					),
+					'required'   => array( 'upload_id', 'index', 'data_base64' ),
+				),
+				'execute'     => array( $this, 'execute_append_chunked_upload' ),
+				'handler'     => array( $this->controller, 'append_chunked_upload' ),
+				'method'      => 'POST',
+				'route'       => '/media/chunked/%s/chunk',
+			),
+			array(
+				'slug'        => 'upload-media-finish',
+				'label'       => 'Finish chunked media upload',
+				'description' => 'Assemble chunks, verify content_md5, and create the media library attachment. Deletes the temp session afterward.',
+				'readonly'    => false,
+				'permission'  => 'upload',
+				'input'       => array(
+					'type'       => 'object',
+					'properties' => array(
+						'upload_id' => array(
+							'type'        => 'string',
+							'description' => 'Session id from upload-media-begin.',
+						),
+					),
+					'required'   => array( 'upload_id' ),
+				),
+				'execute'     => array( $this, 'execute_finish_chunked_upload' ),
+				'handler'     => array( $this->controller, 'finish_chunked_upload' ),
+				'method'      => 'POST',
+				'route'       => '/media/chunked/%s/finish',
+			),
+			array(
+				'slug'        => 'upload-media-abort',
+				'label'       => 'Abort chunked media upload',
+				'description' => 'Delete an in-progress chunked upload session without creating an attachment.',
+				'readonly'    => false,
+				'permission'  => 'upload',
+				'input'       => array(
+					'type'       => 'object',
+					'properties' => array(
+						'upload_id' => array(
+							'type'        => 'string',
+							'description' => 'Session id from upload-media-begin.',
+						),
+					),
+					'required'   => array( 'upload_id' ),
+				),
+				'execute'     => array( $this, 'execute_abort_chunked_upload' ),
+				'handler'     => array( $this->controller, 'abort_chunked_upload' ),
+				'method'      => 'DELETE',
+				'route'       => '/media/chunked/%s',
 			),
 		);
 
@@ -615,6 +720,78 @@ class Abilities_Registrar {
 			REST_Controller::NAMESPACE . $def['route'],
 			$params
 		);
+		return Abilities_Rest_Bridge::invoke( $def['handler'], $request );
+	}
+
+	/**
+	 * POST /media/chunked/begin — no upload_id in route.
+	 *
+	 * @param array<string, mixed> $input Raw input.
+	 * @param array<string, mixed> $def   Ability definition.
+	 * @return array<string, mixed>|\WP_Error
+	 */
+	public function execute_begin_chunked_upload( array $input, array $def ) {
+		$params = Abilities_Rest_Bridge::normalize_input( $input );
+		if ( isset( $params['id'] ) && ! isset( $params['post_id'] ) ) {
+			$params['post_id'] = $params['id'];
+		}
+		$request = Abilities_Rest_Bridge::make_request(
+			$def['method'],
+			REST_Controller::NAMESPACE . $def['route'],
+			$params
+		);
+		return Abilities_Rest_Bridge::invoke( $def['handler'], $request );
+	}
+
+	/**
+	 * POST /media/chunked/{upload_id}/chunk
+	 *
+	 * @param array<string, mixed> $input Raw input.
+	 * @param array<string, mixed> $def   Ability definition.
+	 * @return array<string, mixed>|\WP_Error
+	 */
+	public function execute_append_chunked_upload( array $input, array $def ) {
+		$upload_id = isset( $input['upload_id'] ) ? (string) $input['upload_id'] : '';
+		if ( '' === $upload_id ) {
+			return Abilities_Rest_Bridge::validation_error( __( 'upload_id is required.', 'gk-block-mcp' ) );
+		}
+		$params = Abilities_Rest_Bridge::normalize_input( $input );
+		$route  = sprintf( REST_Controller::NAMESPACE . $def['route'], $upload_id );
+		$request = Abilities_Rest_Bridge::make_request( $def['method'], $route, $params );
+		return Abilities_Rest_Bridge::invoke( $def['handler'], $request );
+	}
+
+	/**
+	 * POST /media/chunked/{upload_id}/finish
+	 *
+	 * @param array<string, mixed> $input Raw input.
+	 * @param array<string, mixed> $def   Ability definition.
+	 * @return array<string, mixed>|\WP_Error
+	 */
+	public function execute_finish_chunked_upload( array $input, array $def ) {
+		$upload_id = isset( $input['upload_id'] ) ? (string) $input['upload_id'] : '';
+		if ( '' === $upload_id ) {
+			return Abilities_Rest_Bridge::validation_error( __( 'upload_id is required.', 'gk-block-mcp' ) );
+		}
+		$route   = sprintf( REST_Controller::NAMESPACE . $def['route'], $upload_id );
+		$request = Abilities_Rest_Bridge::make_request( $def['method'], $route, array( 'upload_id' => $upload_id ) );
+		return Abilities_Rest_Bridge::invoke( $def['handler'], $request );
+	}
+
+	/**
+	 * DELETE /media/chunked/{upload_id}
+	 *
+	 * @param array<string, mixed> $input Raw input.
+	 * @param array<string, mixed> $def   Ability definition.
+	 * @return array<string, mixed>|\WP_Error
+	 */
+	public function execute_abort_chunked_upload( array $input, array $def ) {
+		$upload_id = isset( $input['upload_id'] ) ? (string) $input['upload_id'] : '';
+		if ( '' === $upload_id ) {
+			return Abilities_Rest_Bridge::validation_error( __( 'upload_id is required.', 'gk-block-mcp' ) );
+		}
+		$route   = sprintf( REST_Controller::NAMESPACE . $def['route'], $upload_id );
+		$request = Abilities_Rest_Bridge::make_request( $def['method'], $route, array( 'upload_id' => $upload_id ) );
 		return Abilities_Rest_Bridge::invoke( $def['handler'], $request );
 	}
 

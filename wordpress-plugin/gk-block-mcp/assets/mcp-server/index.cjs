@@ -40658,6 +40658,49 @@ var WordPressBlockClient = class {
     const response = await this.client.post("/media", args);
     return response.data;
   }
+  /** Start a chunked media upload session. */
+  async beginChunkedMediaUpload(args) {
+    const response = await this.client.post(
+      "/media/chunked/begin",
+      args
+    );
+    return response.data;
+  }
+  /** Append one decoded-binary chunk (base64-encoded in the request). */
+  async appendChunkedMediaUpload(args) {
+    const uploadId = String(args.upload_id ?? "");
+    if (!uploadId) {
+      throw new Error("upload_media_chunk: upload_id is required");
+    }
+    const body3 = { ...args };
+    delete body3.upload_id;
+    const response = await this.client.post(
+      `/media/chunked/${uploadId}/chunk`,
+      body3
+    );
+    return response.data;
+  }
+  /** Assemble chunks, verify MD5, create attachment. */
+  async finishChunkedMediaUpload(uploadId) {
+    if (!uploadId) {
+      throw new Error("upload_media_finish: upload_id is required");
+    }
+    const response = await this.client.post(
+      `/media/chunked/${uploadId}/finish`,
+      {}
+    );
+    return response.data;
+  }
+  /** Abort a chunked upload session. */
+  async abortChunkedMediaUpload(uploadId) {
+    if (!uploadId) {
+      throw new Error("upload_media_abort: upload_id is required");
+    }
+    const response = await this.client.delete(
+      `/media/chunked/${uploadId}`
+    );
+    return response.data;
+  }
   // ──────────────────────────────────────────────────────────
   // v1.3 — Yoast SEO metadata (gk-block-api/v1/yoast/...)
   //
@@ -53032,10 +53075,12 @@ async function handleTermTool(toolName, args, client) {
 }
 
 // src/tools/media.ts
+var import_node_crypto = require("node:crypto");
+var CHUNK_RAW_BYTES = 2400;
 var MEDIA_TOOLS = [
   {
     name: "upload_media",
-    description: "Upload an item to the WordPress media library. Provide exactly one of: `path` (local filesystem on the MCP host, sent as multipart), `url` (server-side sideload, 25 MB cap), or `data_base64` (with `filename`). Returns the attachment ID and URL ready for core/image blocks.",
+    description: "Upload an item to the WordPress media library. Prefer `path` (local file on the MCP host, multipart) or `url` (server sideload). Use `data_base64` only for tiny files \u2014 larger single-shot base64 is often truncated by LLM tool calls (invalid_base64). For generated images without a public URL when `path` is unavailable, use upload_media_begin \u2192 upload_media_chunk \u2192 upload_media_finish. Exactly one of path/url/data_base64.",
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true, title: "Upload media" },
     inputSchema: {
       type: "object",
@@ -53050,7 +53095,7 @@ var MEDIA_TOOLS = [
         },
         data_base64: {
           type: "string",
-          description: "Base64-encoded file contents (requires filename)."
+          description: "Base64-encoded file contents for tiny files only (requires filename)."
         },
         filename: {
           type: "string",
@@ -53068,6 +53113,81 @@ var MEDIA_TOOLS = [
           description: "Attach to a parent post (sets post_parent)."
         }
       }
+    }
+  },
+  {
+    name: "upload_media_begin",
+    description: "Start a chunked media upload. Pass filename + content_md5 (hex MD5 of raw file bytes). Then upload_media_chunk for each piece, then upload_media_finish.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false, title: "Begin chunked media upload" },
+    inputSchema: {
+      type: "object",
+      properties: {
+        filename: { type: "string" },
+        content_md5: { type: "string", description: "32-char hex MD5 of the complete raw file." },
+        byte_size: { type: "number" },
+        title: { type: "string" },
+        alt_text: { type: "string" },
+        caption: { type: "string" },
+        description: { type: "string" },
+        post_id: { type: "number" }
+      },
+      required: ["filename", "content_md5"]
+    }
+  },
+  {
+    name: "upload_media_chunk",
+    description: "Append one chunk (base64 of ~2\u20133KB raw bytes). Indexes must be contiguous from 0.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false, title: "Append media upload chunk" },
+    inputSchema: {
+      type: "object",
+      properties: {
+        upload_id: { type: "string" },
+        index: { type: "number" },
+        data_base64: { type: "string" }
+      },
+      required: ["upload_id", "index", "data_base64"]
+    }
+  },
+  {
+    name: "upload_media_finish",
+    description: "Assemble chunks, verify content_md5, create the media library attachment.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false, title: "Finish chunked media upload" },
+    inputSchema: {
+      type: "object",
+      properties: {
+        upload_id: { type: "string" }
+      },
+      required: ["upload_id"]
+    }
+  },
+  {
+    name: "upload_media_abort",
+    description: "Abort a chunked upload session and delete temp chunks.",
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false, title: "Abort chunked media upload" },
+    inputSchema: {
+      type: "object",
+      properties: {
+        upload_id: { type: "string" }
+      },
+      required: ["upload_id"]
+    }
+  },
+  {
+    name: "upload_media_from_path_chunked",
+    description: "Convenience: read a local file on the MCP host, MD5 it, and upload via the chunked REST API (begin/chunk/finish). Prefer upload_media with path (multipart) when available; use this when exercising the chunked path.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false, title: "Chunked upload from local path" },
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        filename: { type: "string" },
+        title: { type: "string" },
+        alt_text: { type: "string" },
+        caption: { type: "string" },
+        description: { type: "string" },
+        post_id: { type: "number" }
+      },
+      required: ["path"]
     }
   }
 ];
@@ -53089,6 +53209,46 @@ async function handleMediaTool(toolName, args, client) {
         throw new Error('upload_media: "filename" is required when using data_base64');
       }
       return client.uploadMedia(args);
+    }
+    case "upload_media_begin":
+      return client.beginChunkedMediaUpload(args);
+    case "upload_media_chunk":
+      return client.appendChunkedMediaUpload(args);
+    case "upload_media_finish":
+      return client.finishChunkedMediaUpload(String(args.upload_id ?? ""));
+    case "upload_media_abort":
+      return client.abortChunkedMediaUpload(String(args.upload_id ?? ""));
+    case "upload_media_from_path_chunked": {
+      if (typeof args.path !== "string" || !args.path) {
+        throw new Error("upload_media_from_path_chunked: path is required");
+      }
+      const fs2 = await import("node:fs/promises");
+      const nodePath = await import("node:path");
+      const data = await fs2.readFile(args.path);
+      const filename = typeof args.filename === "string" && args.filename ? args.filename : nodePath.basename(args.path);
+      const content_md5 = (0, import_node_crypto.createHash)("md5").update(data).digest("hex");
+      const begin = await client.beginChunkedMediaUpload({
+        filename,
+        content_md5,
+        byte_size: data.length,
+        title: args.title,
+        alt_text: args.alt_text,
+        caption: args.caption,
+        description: args.description,
+        post_id: args.post_id
+      });
+      const uploadId = String(begin.upload_id);
+      let index = 0;
+      for (let offset = 0; offset < data.length; offset += CHUNK_RAW_BYTES) {
+        const piece = data.subarray(offset, offset + CHUNK_RAW_BYTES);
+        await client.appendChunkedMediaUpload({
+          upload_id: uploadId,
+          index,
+          data_base64: piece.toString("base64")
+        });
+        index += 1;
+      }
+      return client.finishChunkedMediaUpload(uploadId);
     }
     default:
       throw new Error(`Unknown media tool: ${toolName}`);

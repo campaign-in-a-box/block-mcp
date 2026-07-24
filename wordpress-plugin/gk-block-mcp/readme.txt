@@ -4,7 +4,7 @@ Tags: blocks, rest-api, gutenberg, mcp, ai
 Requires at least: 6.0
 Tested up to: 6.9
 Requires PHP: 7.4
-Stable tag: 2.0.5
+Stable tag: 2.0.6
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -119,6 +119,16 @@ Visit Settings → Block MCP. Set the score for a namespace to less than 10 to m
 `uninstall.php` deletes all plugin options and transients (`gk_block_api_preferences`, `gk_block_api_post_types_allowlist`, `gk_block_api_storage_modes`, the manual dual-storage list, the inventory cache, and per-post rate-limit transients). Post content and revisions are not touched.
 
 == Changelog ==
+
+= 2.0.6 on July 24, 2026 =
+
+#### ✨ Added
+
+* Chunked media upload for agents that cannot pass large base64 in one tool call: `upload-media-begin` → `upload-media-chunk` → `upload-media-finish` (plus `upload-media-abort`). Begin takes `content_md5` (hex MD5 of the raw file); finish verifies it before creating the attachment. REST: `POST /media/chunked/begin`, `POST /media/chunked/{id}/chunk`, `POST /media/chunked/{id}/finish`, `DELETE /media/chunked/{id}`.
+
+#### 🐛 Fixed
+
+* Single-shot `data_base64` now accepts data-URI prefixes and whitespace; `invalid_base64` errors point agents at url sideload or the chunked flow (LLM tool-arg truncation was the usual cause past a few KB).
 
 = 2.0.5 on July 19, 2026 =
 
